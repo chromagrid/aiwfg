@@ -1,0 +1,200 @@
+
+{
+  "name": "AIWF v13",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "aiwf/v13",
+        "responseMode": "responseNode"
+      },
+      "id": "Webhook POST",
+      "name": "Webhook POST",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [ -600, -40 ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const headers = $headers || {};\nconst bearer = (headers.authorization || '').replace(/^Bearer\\s+/i,'');\nconst apiKey = $env.API_KEY || '';\nconst err = (status, msg) => [[], [{ status, body: { error: msg } }]];\nif (apiKey && bearer !== apiKey) { return err(401, 'UNAUTHORIZED'); }\nconst b = $json || {};\nconst rawQ = (b.q ?? b.query ?? '').toString();\nconst q = rawQ.replace(/\\s+/g,' ').trim();\nif (!q) { return err(400, 'EMPTY'); }\nconst maxChars = Number($env.MAX_INPUT_CHARS || 4000);\nif (q.length > maxChars) { return err(413, 'TOO_LARGE'); }\nconst reqId = (global.crypto?.randomUUID?.() || (Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8)));\nreturn [[{\n  path: (b.path||'').toString(),\n  q,\n  locale: (b.locale||'en').toString(),\n  allowWeb: Boolean(b.allowWeb||false),\n  policyVersion: (b.policyVersion||'v1').toString(),\n  model: $env.TOP_MODEL,\n  max_tokens: Number($env.MAX_TOKENS||1024),\n  temperature: Number($env.TEMPERATURE||0.2),\n  reqId\n}]];"
+      },
+      "id": "Normalize+Auth+Guards",
+      "name": "Normalize+Auth+Guards",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ -360, -40 ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const crypto = require('crypto');\nconst stable = {\n  q: $json.q,\n  path: $json.path||'',\n  locale: $json.locale||'',\n  policyVersion: $json.policyVersion||'',\n  allowWeb: Boolean($json.allowWeb||false),\n  model: $json.model,\n  max_tokens: $json.max_tokens,\n  temperature: $json.temperature\n};\nconst key = crypto.createHash('sha256').update(JSON.stringify(stable)).digest('hex');\nreturn [{ cacheKey: key, ...$json }];"
+      },
+      "id": "CacheKey",
+      "name": "CacheKey",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ -120, -40 ]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.REDIS_BASE_URL}}/GET/{{$json.cacheKey}}",
+        "options": {
+          "timeout": "={{$env.HTTP_TIMEOUT_MS||15000}}"
+        }
+      },
+      "id": "Redis GET",
+      "name": "Redis GET",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 2,
+      "position": [ 120, -40 ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Redis REST Auth",
+          "id": "redis-rest-headers"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "let text = null;\nif (typeof $json.result === 'string') text = $json.result;\nelse if ($json.body && typeof $json.body.result === 'string') text = $json.body.result;\nif (text) {\n  try { const parsed = JSON.parse(text); return [[{ response: parsed, cache_hit: true }], []]; } catch {}\n}\nreturn [[], [$json]];"
+      },
+      "id": "Cache Hit?",
+      "name": "Cache Hit?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ 360, -40 ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendBody": true,
+        "jsonParameters": true,
+        "options": {
+          "timeout": "={{$env.HTTP_TIMEOUT_MS||15000}}"
+        },
+        "bodyParametersJson": "={{ JSON.stringify({\n  model: $json.model || $env.TOP_MODEL,\n  messages: [\n    { role:\"system\", content: \"You are a precise assistant. Return ONLY valid JSON matching the schema. No markdown, no prose. If unsure, use empty arrays. Schema follows.\" },\n    { role:\"system\", content: \"{\\\"type\\\":\\\"object\\\",\\\"required\\\":[\\\"answer\\\",\\\"steps\\\",\\\"citations\\\",\\\"meta\\\"],\\\"properties\\\":{\\\"answer\\\":{\\\"type\\\":\\\"string\\\"},\\\"steps\\\":{\\\"type\\\":\\\"array\\\",\\\"items\\\":{\\\"type\\\":\\\"string\\\"}},\\\"citations\\\":{\\\"type\\\":\\\"array\\\",\\\"items\\\":{\\\"type\\\":\\\"string\\\"}},\\\"meta\\\":{\\\"type\\\":\\\"object\\\",\\\"properties\\\":{\\\"notes\\\":{\\\"type\\\":\\\"string\\\"}}}}\" },\n    { role:\"user\", content: $json.q }\n  ],\n  response_format: { type: \"json_object\" },\n  max_tokens: Number($json.max_tokens||$env.MAX_TOKENS||1024),\n  temperature: Number($json.temperature||$env.TEMPERATURE||0.2)\n}) }}"
+      },
+      "id": "LLM Solve (TopTier)",
+      "name": "LLM Solve (TopTier)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 2,
+      "position": [ 600, -140 ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "OpenRouter Auth",
+          "id": "openrouter-headers"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const body = $json.body || $json.data || $json;\nlet content = (body && body.choices && body.choices[0] && body.choices[0].message && body.choices[0].message.content) || '';\nlet resp = null;\ntry { resp = (typeof content === 'string') ? JSON.parse(content) : content; } catch (e) {}\nconst fail = (status, msg) => [[], [{ status, body: { error: msg } }]];\nif (!resp || typeof resp !== 'object') return fail(502,'INVALID_MODEL_OUTPUT');\nif (typeof resp.answer !== 'string') resp.answer = String(resp.answer||'');\nif (!Array.isArray(resp.steps)) resp.steps = [];\nif (!Array.isArray(resp.citations)) resp.citations = [];\nresp.meta = { ...(resp.meta||{}), model: ($env.TOP_MODEL||'unknown'), cache_hit: false };\nconst cache_value = JSON.stringify(resp);\nreturn [[{ response: resp, cache_value }]];"
+      },
+      "id": "Finalize",
+      "name": "Finalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ 840, -140 ]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.REDIS_BASE_URL}}/SETEX/{{$json.cacheKey}}/{{$env.CACHE_TTL||900}}/{{encodeURIComponent($json.cache_value)}}",
+        "options": {
+          "timeout": "={{$env.HTTP_TIMEOUT_MS||15000}}"
+        }
+      },
+      "id": "Redis SETEX",
+      "name": "Redis SETEX",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 2,
+      "position": [ 1080, -140 ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Redis REST Auth",
+          "id": "redis-rest-headers"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {
+          "responseCode": 200
+        },
+        "responseData": "={{JSON.stringify($json.response)}}"
+      },
+      "id": "Respond OK",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [ 1320, -140 ]
+    },
+    {
+      "parameters": {
+        "options": {
+          "responseCode": "={{$json.status||500}}",
+          "responseHeaders": {
+            "entries": [
+              { "name": "Content-Type", "value": "application/json" }
+            ]
+          }
+        },
+        "responseData": "={{JSON.stringify($json.body||{error:'UNKNOWN'})}}"
+      },
+      "id": "Respond Error",
+      "name": "Respond Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [ 1320, 120 ]
+    }
+  ],
+  "connections": {
+    "Webhook POST": {
+      "main": [
+        [ { "node": "Normalize+Auth+Guards", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Normalize+Auth+Guards": {
+      "main": [
+        [ { "node": "CacheKey", "type": "main", "index": 0 } ],
+        [ { "node": "Respond Error", "type": "main", "index": 0 } ]
+      ]
+    },
+    "CacheKey": {
+      "main": [
+        [ { "node": "Redis GET", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Redis GET": {
+      "main": [
+        [ { "node": "Cache Hit?", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Cache Hit?": {
+      "main": [
+        [ { "node": "Respond OK", "type": "main", "index": 0 } ],
+        [ { "node": "LLM Solve (TopTier)", "type": "main", "index": 0 } ]
+      ]
+    },
+    "LLM Solve (TopTier)": {
+      "main": [
+        [ { "node": "Finalize", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Finalize": {
+      "main": [
+        [ { "node": "Redis SETEX", "type": "main", "index": 0 } ],
+        [ { "node": "Respond Error", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Redis SETEX": {
+      "main": [
+        [ { "node": "Respond OK", "type": "main", "index": 0 } ]
+      ]
+    }
+  }
+}
+
